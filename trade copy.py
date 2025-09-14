@@ -2,24 +2,38 @@ from ib_insync import LimitOrder
 import datetime
 import time
 
+from position_size_calc import calc_pos_size
 
 class Trade:
     slippage = 0.001           # initial slippage
     adaptive_inc = 0.0005      # slippage increase per retry
 
-    def __init__(self, ib, contract, signal, size, adaptive_slippage=True):
+    def __init__(self, ib, contract, signal, adaptive_slippage=True):
         self.ib = ib
         self.contract = contract
         self.signal = signal.upper()
-        self.size = size
         self.adaptive_slippage = adaptive_slippage
         self.trade = None
         self.fill_time = None
         self.start_time = datetime.datetime.now()
         self.retry_count = 0
         self.final_slippage = self.slippage
+        self.size = 0
         self.TEST_MODE = False
 
+
+    def _get_size(self, price):
+        return calc_pos_size(self.ib, price)
+        
+    def _get_current_price(self, timeout = 5):
+        ticker = self.ib.reqMktData(self.contract, snapshot=True, regulatorySnapshot=False)
+        self.ib.waitOnUpdate(timeout)
+
+        price = ticker.last or ticker.close or ticker.bid or ticker.ask
+        if not price:
+            raise ValueError("No valid price available from market data.")
+        return price
+    
     def _calculate_limit_price(self, price):
         if self.signal == 'BUY':
             return round(price * (1 + self.slippage), 2)
@@ -30,19 +44,25 @@ class Trade:
 
     def _place_limit_order(self, price):
         limit_price = self._calculate_limit_price(price)
-        order = LimitOrder(self.signal, self.size, limit_price, outsideRth=True)
+        self.size = self._get_size(limit_price)
+
+        order = LimitOrder(self.signal, self.size, limit_price, outsideRth=True) #outsideRTH means you can place order outside regular trading hours
         self.trade = self.ib.placeOrder(self.contract, order)
-        self.ib.sleep(1)  # allow IBKR to update order status
+        self.ib.waitOnUpdate(1)  # allow IBKR to update order status
 
         status = self.trade.orderStatus.status
         if status in ['Inactive', 'Rejected']:
-            print(f"❌ Order was {status} immediately after submission.")
+            print(f" Order was {status} immediately after submission.")
             return None
         return limit_price
 
     def fill_and_ensure(self, max_wait_min=15, retry_interval_sec=60):
         if self.TEST_MODE:
             mock_price = self._get_current_price()
+
+            if self.size <= 0: #computes the position size if it is test mode and the _place_limit_order() function isn't called
+                self.size = self._get_size(mock_price)
+
             print(f"[TEST_MODE] Simulated {self.signal} of {self.size} at {mock_price}")
             return True, mock_price
 
@@ -71,8 +91,14 @@ class Trade:
 
             retry_count += 1
             print(f"⚠️ Not filled in {retry_interval_sec}s - cancelling and retrying (attempt #{retry_count})")
+            
             self.ib.cancelOrder(self.trade.order)
-            self.ib.sleep(2)
+            for _ in range(10):
+              self.ib.waitOnUpdate(0.5)  
+              if self.trade.orderStatus.status in ('Cancelled', 'apiCancelled'):
+                  break
+            
+            
 
         print(f"❌ Order not filled within {max_wait_min} minutes.")
         return False, None
@@ -80,7 +106,7 @@ class Trade:
     def _wait_for_fill(self, timeout):
         start = time.monotonic()
         while time.monotonic() - start < timeout:
-            self.ib.sleep(1)
+            self.ib.waitOnUpdate(1)
             if self.trade.orderStatus.status == 'Filled':
                 if self.trade.fills:
                     self.fill_time = self.trade.fills[-1].time
@@ -92,11 +118,4 @@ class Trade:
             return True
         return False
 
-    def _get_current_price(self):
-        ticker = self.ib.reqMktData(self.contract, snapshot=True, regulatorySnapshot=False)
-        self.ib.sleep(2)
-
-        price = ticker.last or ticker.close or ticker.bid or ticker.ask
-        if not price:
-            raise ValueError("❌ No valid price available from market data.")
-        return price
+    

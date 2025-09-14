@@ -6,7 +6,7 @@
 #DONE#   change PnL calculations, as right now the calculation gives negative calculations
 #change loop logic so that if the bot crashes, it only retries to connect for an hour. 
 #max email send should be 60.
-#DONE#    change IBKR password to remove capital letters
+#DONE line 211#    change IBKR password to remove capital letters
 #watchdog.py does not work
 #check to see if current subscription does give instantaneous price, or if there has to be a delay. 
 #consider using POLYGON.io to stream data, and put in trades using IBKR
@@ -31,13 +31,14 @@ from get_data import get_hma_strat8_data
 from state_functions import load_state, write_state
 
 
+
 #loads email information
 
 load_dotenv()
 
 #global position size, and slippace percentage
 
-position_size = 10
+#position_size = 10
 ticker = 'NVDA'
 
 #sets the email info from env. into these
@@ -160,7 +161,8 @@ def is_market_open_today():
 
 # === Main Bot ===
 
-def run_hma200strat8(email_settings, position_size, threshold=1.2, log_file='trade_log.csv'):
+def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
+
 
     #runs perpetually while True
     while True:
@@ -208,6 +210,7 @@ def run_hma200strat8(email_settings, position_size, threshold=1.2, log_file='tra
                         print(f"❌ Reconnection failed: ({retry_count}/{MAX_RECONNECT}) attempts: {e}")
                         log_exception(f"Reconnection failed: {e}")
 
+                        #if tries to reconnect MAX_RECONNECT amount of times, this part stops it
                         if retry_count >= MAX_RECONNECT:
                             print("Max retries reached. Exiting bot.")
                             send_email("hma_200strat8 STOPPED",
@@ -288,7 +291,7 @@ def run_hma200strat8(email_settings, position_size, threshold=1.2, log_file='tra
 
                         #exits trade IF already in a BUY position (1)
 
-                        exit_trade = Trade(ib, contract, signal, position_size)
+                        exit_trade = Trade(ib, contract, signal)
 
                         #returns fill price, and boolean for filled
 
@@ -342,7 +345,7 @@ def run_hma200strat8(email_settings, position_size, threshold=1.2, log_file='tra
 
                         #creates trade and executes
 
-                        exit_trade = Trade(ib, contract, signal, position_size)
+                        exit_trade = Trade(ib, contract, signal)
 
                         #boolean to check if filled, and order fill price
                         filled, exit_fill_price = exit_trade.fill_and_ensure()
@@ -397,7 +400,7 @@ def run_hma200strat8(email_settings, position_size, threshold=1.2, log_file='tra
                             signal = 'SELL'
 
                             #creates and executes trade
-                            exit_trade = Trade(ib, contract, signal, position_size)
+                            exit_trade = Trade(ib, contract, signal)
                             filled, exit_fill_price = exit_trade.fill_and_ensure()
                             ib.sleep(1)
 
@@ -429,7 +432,7 @@ def run_hma200strat8(email_settings, position_size, threshold=1.2, log_file='tra
 
                             signal = 'BUY'
 
-                            exit_trade = Trade(ib, contract, signal, position_size)
+                            exit_trade = Trade(ib, contract, signal)
                             filled, exit_fill_price = exit_trade.fill_and_ensure()
                             ib.sleep(1)
 
@@ -470,7 +473,7 @@ def run_hma200strat8(email_settings, position_size, threshold=1.2, log_file='tra
 
                         
                         if signal in ['BUY', 'SELL'] and entry_type:
-                            entry_trade = Trade(ib, contract, signal, position_size)
+                            entry_trade = Trade(ib, contract, signal)
                             filled, entry_fill_price = entry_trade.fill_and_ensure()
 
                             ib.sleep(1)
@@ -533,4 +536,4 @@ def run_hma200strat8(email_settings, position_size, threshold=1.2, log_file='tra
 
 
 if __name__ == '__main__':
-    run_hma200strat8(email_settings, position_size)
+    run_hma200strat8(email_settings)
