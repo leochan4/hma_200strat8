@@ -1,6 +1,6 @@
 ##############################################################################
 #TO DO
-#Stay in TESTMODE while I don't have live price streaming. Test code logic first. 
+#DONE #Stay in TESTMODE while I don't have live price streaming. Test code logic first. 
 #change reqHistoricalData() to reqMktData() once ready to get live price streaming.
 
 #DONE#   change PnL calculations, as right now the calculation gives negative calculations
@@ -11,7 +11,12 @@
 #check to see if current subscription does give instantaneous price, or if there has to be a delay. 
 #consider using POLYGON.io to stream data, and put in trades using IBKR
 
+#Create a trade exit during high-volatility times like earnings and FOMC rate decisions
+
 ###############################################################################
+
+#CHATGPT verfied#
+
 from ib_insync import *
 import sys 
 import pandas as pd
@@ -25,12 +30,23 @@ from email.mime.text import MIMEText
 from dotenv import load_dotenv
 import json
 import pandas_market_calendars as mcal
+from zoneinfo import ZoneInfo
 
-from trade import Trade
+# local market timezone, not local computer's
+NY = ZoneInfo("America/New_York")
+COMM_PER_SHARE = 0.01
+
+
+
+
+from tradev2 import Trade
 from get_data import get_hma_strat8_data
 from state_functions import load_state, write_state
 
+# paused status will change to 'true' if an exit order is not filled
+# the algo will unpause if a pause sentinel is created in the folder. This file will be removed once continues
 
+PAUSE_SENTINEL = "resume.txt" 
 
 #loads email information
 
@@ -52,16 +68,21 @@ email_settings = {
     'password': os.getenv('EMAIL_PASSWORD')
 }
 
+# === Returns the current time in whole 15mins === #
+
+def floor_to_bar(dt, minutes=15):
+    m = (dt.minute // minutes) * minutes
+    return dt.replace(minute=m, second=0, microsecond=0)
 
 # === CSV Logger ===
 
-def log_trade(entry_time, action, entry_type, entry_price, exit_price, filename='trade_log.csv'):
+def log_trade(entry_time, action, entry_type, entry_price, exit_price, fill_qty, comm, filename='trade_log.csv'):
 
     #calculates PnL on completed trade
     if action == "SHORT":
-        pnl = round(entry_price - exit_price, 4)
+        pnl = (entry_price - exit_price)*fill_qty
     elif action == "LONG":
-        pnl = round(exit_price - entry_price, 4)
+        pnl = (exit_price - entry_price)*fill_qty
     else:
         pnl = None
 
@@ -74,7 +95,9 @@ def log_trade(entry_time, action, entry_type, entry_price, exit_price, filename=
         'Entry Type': entry_type,
         'Entry Price': round(entry_price, 2),
         'Exit Price': round(exit_price, 2),
-        'PnL': pnl
+        'Fill Quantity': fill_qty,
+        'Commissions': comm,
+        'PnL': round(pnl, 2) if pnl is not None else None
     }
 
     #convert to df
@@ -101,23 +124,33 @@ def send_email(subject, body, config):
         print(f"Email failed: {e}")
 
 
+# === Get local Time Zone === #
+
+def now_tz(tz: str = "NY") -> datetime.datetime:
+    if tz == "NY":
+        return datetime.datetime.now(NY)
+    if tz == "LOCAL":
+        return datetime.datetime.now().astimezone()
+    raise ValueError("tz must be 'NY' or 'LOCAL'")
+
 # === Exception Log ===
 
-def log_exception(message, filename='error_log.txt'):
-    with open(filename, 'a') as f:
-        f.write(f"{datetime.datetime.now()}: {message}\n")
+def log_exception(message, filename='error_log.txt', tz = 'NY'):
+    dt = now_tz(tz)
+    with open(filename, 'a', encoding='utf-8') as f:
+        f.write(f"{dt:%Y-%m-%d %H:%M:%S %Z}: {message}\n")
 
 
 # === Backup Log File === #
 
-def backup_file(src_path, backup_dir='backups'):
+def backup_file(src_path, backup_dir='backups', tz = 'NY'):
+    import shutil, os
     os.makedirs(backup_dir, exist_ok=True)
-    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    ts = now_tz(tz).strftime('%Y%m%d_%H%M%S')
 
     #creates new backup path
-    backup_path = os.path.join(backup_dir, f"{os.path.basename(src_path).split('.')[0]}_{timestamp}.csv")
+    backup_path = os.path.join(backup_dir, f"{os.path.basename(src_path).split('.')[0]}_{ts}.csv")
     if os.path.exists(src_path):
-        import shutil
         shutil.copy(src_path, backup_path)
 
 
@@ -129,7 +162,7 @@ def is_market_open_extended():
     Returns True if within any trading window.
     """
 
-    # Current time in US/Eastern timezone
+    '''# Current time in US/Eastern timezone
     from pytz import timezone
     eastern = timezone('US/Eastern')
     now = datetime.datetime.now(eastern).time()
@@ -142,27 +175,63 @@ def is_market_open_extended():
 
     # Check if current time falls into any of these windows
     if premarket_start <= now < postmarket_end:
-        return True
-    return False
+        return True'''
+    
+    now = datetime.datetime.now(NY).time()
+    
+    return datetime.time(4, 0) <= now < datetime.time(20, 0)
 
 
 def is_market_open_today():
     """
     Returns True if today is a valid trading day (excludes weekends and U.S. holidays).
-    """
+    
     nyse = mcal.get_calendar('NYSE')
-    today = pd.Timestamp(datetime.datetime.now().date(), tz='America/New_York')
+    today = pd.Timestamp(datetime.date.today())
 
     # Get the next valid open date (including today if it's a valid session)
-    schedule = nyse.schedule(start_date=today, end_date=today)
+    schedule = nyse.schedule(start_date=today, end_date=today)"""
+    nyse = mcal.get_calendar('NYSE')
+    today = datetime.datetime.now(NY).strftime('%Y-%m-%d')
 
+    schedule = nyse.schedule(start_date = today, end_date=today)
     return not schedule.empty
 
+# === Crosschecks internal trade status (json) with broker === #
+
+def broker_reconcile(ib, contract, expected_pos, account_id=None):
+
+    if account_id is None:
+        accts = ib.managedAccounts()
+        account_id = accts[0] if accts else None
+
+    live_qty = 0
+    for p in ib.positions():
+        if account_id and p.account != account_id:
+            continue
+        if getattr(p.contract, "conId", None) == getattr(contract, "conId", None):
+            live_qty += p.position
+
+    live_pos = 0 if live_qty == 0 else (1 if live_qty > 0 else -1)
+
+    if live_pos != expected_pos:
+        msg = (f"Position mismatch for {contract.symbol}: "
+               f"live={live_pos} (qty={live_qty}), state={expected_pos}, account={account_id}")
+
+        print(msg)
+        log_exception(msg, tz='LOCAL')
+        send_email("Position mismatch", msg, email_settings)
+
+        return live_pos, False
+    
+    return expected_pos, True
 
 # === Main Bot ===
 
 def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
 
+    paused = False
+    last_bar_ts = None
 
     #runs perpetually while True
     while True:
@@ -175,6 +244,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
 
             #creates contract, pick stock of choice
             contract = Stock(ticker, 'SMART', 'USD')
+            [contract] = ib.qualifyContracts(contract)
 
             #default parameters
             current_position = 0
@@ -190,8 +260,9 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
             current_position = state['position']
             entry_type = state['entry_type']
             entry_fill_price = state['entry_price']
+            paused = state.get('paused', False)
 
-            print("✅ Bot started. Waiting for 15-min intervals...")
+            print("Bot started. Waiting for 15-min intervals...")
             
             #calculates and checks indicators every 15min
             retry_count = 0
@@ -199,16 +270,27 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
 
             while True:
 
+                if paused:
+                    print(f"Bot paused at market time {datetime.datetime.now(NY)}."
+                          f"Create '{PAUSE_SENTINEL}' to resume.")
+                    if os.path.exists(PAUSE_SENTINEL):
+                        os.remove(PAUSE_SENTINEL)
+                        paused = False
+                        print("Resuming Algo...")
+                    time.sleep(10)
+                    continue
+
+
                 # Check if disconnected from TWS, reconnect if needed
                 if not ib.isConnected():
-                    print("🔄 Reconnecting to IBKR...")
+                    print("Reconnecting to IBKR...")
                     try:
                         ib.connect('127.0.0.1', 7497, clientId=1)
                         print("✅ Reconnected.")
                     except Exception as e:
                         retry_count += 1
                         print(f"❌ Reconnection failed: ({retry_count}/{MAX_RECONNECT}) attempts: {e}")
-                        log_exception(f"Reconnection failed: {e}")
+                        log_exception(f"Reconnection failed: {e}", tz='LOCAL')
 
                         #if tries to reconnect MAX_RECONNECT amount of times, this part stops it
                         if retry_count >= MAX_RECONNECT:
@@ -222,7 +304,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                         continue  # Try again in next loop
 
 
-                now = datetime.datetime.now()
+                now = datetime.datetime.now(NY)
 
                 # Manual override check
 
@@ -236,7 +318,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                 
                 # Skip weekends and U.S. holidays
                 if not is_market_open_today():
-                    print(f"📅 {now.strftime('%Y-%m-%d')} is a holiday or weekend. Skipping.")
+                    print(f" {now.strftime('%Y-%m-%d')} is a holiday or weekend. Skipping.")
                     time.sleep(3600)  # Sleep for 1 hour
                     continue
 
@@ -245,17 +327,20 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                     time.sleep(3600)
                     continue
                 
+                bar_ts = floor_to_bar(now, 15)
 
                 #checks if minute is factor of 15: eg. 5:45, 3:15, 9:00 etc.
 
-                if now.minute % 15 == 0 and now.second < 15:
-                    print(f"\n🕒 {now.strftime('%Y-%m-%d %H:%M:%S')} Checking market...")
+                if bar_ts != last_bar_ts and now >= bar_ts + datetime.timedelta(seconds=10):
+
+                    last_bar_ts = bar_ts #immediately updates used bar_ts so that process doesn't repeat for the same bar
+
+                    #if now.minute % 15 == 0 and now.second < 15:
+                    print(f"\n {now:%Y-%m-%d %H:%M:%S %Z} Checking market...")
 
                     #retrives the previous days candle bars, calculates indicator values
 
-                    time.sleep(5)
-
-                    latest, prev = get_hma_strat8_data(ib, contract)
+                    latest, prev = get_hma_strat8_data(ib, contract, end_dt = bar_ts)
 
                     print("Latest:", latest)
                     print("Previous:", prev)
@@ -283,7 +368,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                     # OC reversal exits
 
                     #For BUY position
-                    if current_position == 1 and latest['oc_pct_change'] < -threshold:
+                    if current_position == 1 and (latest['oc_pct_change'] < -threshold or latest['gap_pct_change'] < -threshold):
                         
                         #changes signal to get out of BUY position
 
@@ -295,7 +380,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
 
                         #returns fill price, and boolean for filled
 
-                        filled, exit_fill_price = exit_trade.fill_and_ensure()
+                        filled = exit_trade.fill_and_ensure()
                         ib.sleep(1)
 
                         #logs, backup, writes, emails, and resets parameters if order filled
@@ -307,22 +392,36 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                                 print("[TEST_MODE] Simulated trade — no orderStatus to display.")
                             else:
                                 print(exit_trade.trade.orderStatus.status)
+
+                            
         
                             #log trade
 
-                            log_trade(now, 'LONG', entry_type, entry_fill_price, exit_fill_price, log_file)
-                            backup_file('trade_log.csv')
+                            log_trade(now, 'LONG', entry_type, entry_fill_price, exit_trade.avg_fill_price, exit_trade.filled_qty, exit_trade.total_comm, log_file)
+                            backup_file('trade_log.csv', tz='LOCAL')
 
                             #reset
                             current_position = 0; entry_type = None; entry_fill_price = None
+                            
+                            #reconcile with broker
+                            ib.sleep(1)
+                            live_pos, ok = broker_reconcile(ib, contract, expected_pos=0)
+                            current_position = live_pos
+
+                            if ok:
+                                print("broker reconcilation complete - no issues")
+                            else:
+                                print("broker reconcilation complete - discrepancy")
+
+                            
 
                             #saves latest state into state.json
 
-                            write_state(current_position, entry_type, entry_fill_price)
+                            write_state(current_position, entry_type, entry_fill_price, paused)
 
                             #creates message and sends email
 
-                            exit_msg = f"hma_200strat8 exited with a {signal} position at {exit_fill_price} due to OC reversal"
+                            exit_msg = f"hma_200strat8 exited with a {signal} position at {exit_trade.avg_fill_price} due to OC reversal"
                             print(exit_msg)
                             send_email("NVDA exit", exit_msg, email_settings)
 
@@ -332,12 +431,14 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                         else:
 
                             #manual exit required. 
-
-                            send_email("hma_200strat8 ORDER FAILED", f"{signal} order failed to fill.", email_settings)
+                            paused = True
+                            write_state(current_position, entry_type, entry_fill_price, paused)
+                            send_email("hma_200strat8 EXIT ORDER FAILED", f"{signal} order failed to fill.", email_settings)
+                            continue
 
                     #repeats for SELL position        
 
-                    if current_position == -1 and latest['oc_pct_change'] > threshold:
+                    if current_position == -1 and (latest['oc_pct_change'] > threshold or latest['gap_pct_change'] > threshold):
                         
                         #changes signal to get out of BUY position
 
@@ -348,7 +449,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                         exit_trade = Trade(ib, contract, signal)
 
                         #boolean to check if filled, and order fill price
-                        filled, exit_fill_price = exit_trade.fill_and_ensure()
+                        filled = exit_trade.fill_and_ensure()
                         ib.sleep(1)
 
                         if filled:
@@ -362,20 +463,32 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                             
                             #log trade
 
-                            log_trade(now, 'SHORT', entry_type, entry_fill_price, exit_fill_price, log_file)
-                            backup_file('trade_log.csv')
+                            log_trade(now, 'SHORT', entry_type, entry_fill_price, exit_trade.avg_fill_price, exit_trade.filled_qty, exit_trade.total_comm, log_file)
+                            backup_file('trade_log.csv', tz='LOCAL')
                             
                             #reset
 
                             current_position = 0; entry_type = None; entry_fill_price = None
+                        
+                            #reconcile with broker
+                            ib.sleep(1)
+                            live_pos, ok = broker_reconcile(ib, contract, expected_pos=0)
+                            current_position = live_pos
+
+                            if ok:
+                                print("broker reconcilation complete - no issues")
+                            else:
+                                print("broker reconcilation complete - discrepancy")
                             
+                            
+
                             #saves position into state.json
                             
-                            write_state(current_position, entry_type, entry_fill_price)
+                            write_state(current_position, entry_type, entry_fill_price, paused)
 
                             #creates message and sends email
 
-                            exit_msg = f"hma_200strat8 exited with a {signal} position at {exit_fill_price} due to OC reversal"
+                            exit_msg = f"hma_200strat8 exited with a {signal} position at {exit_trade.avg_fill_price} due to OC reversal"
                             print(exit_msg)
                             send_email("NVDA exit", exit_msg, email_settings)
 
@@ -386,9 +499,10 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                         else:
 
                             #manual exit required. 
-
-                            send_email("hma_200strat8 ORDER FAILED", f"{signal} order failed to fill.", email_settings)
-
+                            paused = True
+                            write_state(current_position, entry_type, entry_fill_price, paused)
+                            send_email("hma_200strat8 EXIT ORDER FAILED", f"{signal} order failed to fill.", email_settings)
+                            continue
 
                     # Exit logic
                     if current_position == 1:
@@ -401,7 +515,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
 
                             #creates and executes trade
                             exit_trade = Trade(ib, contract, signal)
-                            filled, exit_fill_price = exit_trade.fill_and_ensure()
+                            filled = exit_trade.fill_and_ensure()
                             ib.sleep(1)
 
                             #same as oc exit
@@ -413,18 +527,35 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                                 else:
                                     print(exit_trade.trade.orderStatus.status)
 
-                                log_trade(now, 'LONG', entry_type, entry_fill_price, exit_fill_price, log_file)
-                                backup_file('trade_log.csv')
+                                log_trade(now, 'LONG', entry_type, entry_fill_price, exit_trade.avg_fill_price, exit_trade.filled_qty, exit_trade.total_comm, log_file)
+                                backup_file('trade_log.csv', tz='LOCAL')
 
-                                exit_msg = f"hma_200strat8 exited {signal} position at {exit_fill_price}"
+                                exit_msg = f"hma_200strat8 exited {signal} position at {exit_trade.avg_fill_price}"
                                 print(exit_msg)
                                 send_email("NVDA exit", exit_msg, email_settings)
                             
                                 current_position = 0; entry_type = None; entry_fill_price = None
-                                write_state(current_position, entry_type, entry_fill_price)
+
+                                #reconcile with broker
+                                ib.sleep(1)
+                                live_pos, ok = broker_reconcile(ib, contract, expected_pos=0)
+                                current_position = live_pos
+
+                                if ok:
+                                    print("broker reconcilation complete - no issues")
+                                else:
+                                    print("broker reconcilation complete - discrepancy")
+                                
+                                
+
+                                write_state(current_position, entry_type, entry_fill_price, paused)
 
                             else:
-                                send_email("hma_200strat8 ORDER FAILED", f"{signal} order failed to fill.", email_settings)
+
+                                paused = True
+                                write_state(current_position, entry_type, entry_fill_price, paused)
+                                send_email("hma_200strat8 EXIT ORDER FAILED", f"{signal} order failed to fill.", email_settings)
+                                continue    
 
                     if current_position == -1:
                         if (entry_type == 'short1' and (latest['HMA_200'] < latest['SMA_300'] or latest['HMA_diff'] > 0)) or \
@@ -433,7 +564,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                             signal = 'BUY'
 
                             exit_trade = Trade(ib, contract, signal)
-                            filled, exit_fill_price = exit_trade.fill_and_ensure()
+                            filled = exit_trade.fill_and_ensure()
                             ib.sleep(1)
 
                              #same as oc exit
@@ -445,18 +576,34 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                                 else:
                                     print(exit_trade.trade.orderStatus.status)
 
-                                log_trade(now, 'SHORT', entry_type, entry_fill_price, exit_fill_price, log_file)
-                                backup_file('trade_log.csv')
+                                log_trade(now, 'SHORT', entry_type, entry_fill_price, exit_trade.avg_fill_price, exit_trade.filled_qty, exit_trade.total_comm, log_file)
+                                backup_file('trade_log.csv', tz='LOCAL')
 
-                                exit_msg = f"hma_200strat8 exited {signal} position at {exit_fill_price}"
+                                exit_msg = f"hma_200strat8 exited {signal} position at {exit_trade.avg_fill_price}"
                                 print(exit_msg)
                                 send_email("NVDA exit", exit_msg, email_settings)
                             
                                 current_position = 0; entry_type = None; entry_fill_price = None
-                                write_state(current_position, entry_type, entry_fill_price)
+
+                                #reconcile with broker
+                                ib.sleep(1)
+                                live_pos, ok = broker_reconcile(ib, contract, expected_pos=0)
+                                current_position = live_pos
+
+                                if ok:
+                                    print("broker reconcilation complete - no issues")
+                                else:
+                                    print("broker reconcilation complete - discrepancy")
+                                
+
+                                write_state(current_position, entry_type, entry_fill_price, paused)
 
                             else:
-                                send_email("hma_200strat8 ORDER FAILED", f"{signal} order failed to fill.", email_settings)
+
+                                paused = True
+                                write_state(current_position, entry_type, entry_fill_price, paused)
+                                send_email("hma_200strat8 EXIT ORDER FAILED", f"{signal} order failed to fill.", email_settings)
+                                continue
 
                     # Entry logic
                     if current_position == 0:
@@ -474,7 +621,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                         
                         if signal in ['BUY', 'SELL'] and entry_type:
                             entry_trade = Trade(ib, contract, signal)
-                            filled, entry_fill_price = entry_trade.fill_and_ensure()
+                            filled = entry_trade.fill_and_ensure()
 
                             ib.sleep(1)
 
@@ -490,10 +637,21 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                                 #sets position parameters
 
                                 current_position = 1 if signal == 'BUY' else -1
+                                entry_fill_price = entry_trade.avg_fill_price
+
+                                #expected_pos should be the position bought into, the other expected_pos should be zero bc you're getting out of the trade
+                                live_pos, ok = broker_reconcile(ib, contract, expected_pos=current_position) 
+
+                                current_position = live_pos #sets the current position to the actual position IBKR has
+
+                                if ok:
+                                    print("broker reconcilation complete - no issues")
+                                else:
+                                    print("broker reconcilation complete - discrepancy")
 
                                 #writes the updated parameters onto state.json
 
-                                write_state(current_position, entry_type, entry_fill_price)
+                                write_state(current_position, entry_type, entry_fill_price, paused)
 
                                 #writes entry message and sends email
 
@@ -509,14 +667,9 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                             print(f"No valid signal or entry_type (signal={signal}, entry_type={entry_type}) — skipping trade")    
                             #creates and executes trade
                         
-            
-
-                            
                     
-                            
 
-                    time.sleep(60)
-                time.sleep(10)
+                time.sleep(1)
 
         #any errors will channel here
 
@@ -528,7 +681,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
             send_email("hma_200strat8 BOT CRASHED", msg, email_settings)
             
             #logs error onto .csv
-            log_exception(msg)  # Log to file
+            log_exception(msg, tz='LOCAL')  # Log to file
 
 
 
