@@ -1,4 +1,4 @@
-#CHATGPT VALIDATED#
+#validated#
 
 
 from ib_insync import LimitOrder

@@ -1,4 +1,4 @@
-#CHATGPT verified#
+#verified#
 
 from ib_insync import *
 import pandas as pd

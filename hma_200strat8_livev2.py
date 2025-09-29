@@ -3,19 +3,15 @@
 #DONE #Stay in TESTMODE while I don't have live price streaming. Test code logic first. 
 #change reqHistoricalData() to reqMktData() once ready to get live price streaming.
 
-#DONE#   change PnL calculations, as right now the calculation gives negative calculations
-#change loop logic so that if the bot crashes, it only retries to connect for an hour. 
-#max email send should be 60.
 #DONE line 211#    change IBKR password to remove capital letters
 #watchdog.py does not work
 #check to see if current subscription does give instantaneous price, or if there has to be a delay. 
-#consider using POLYGON.io to stream data, and put in trades using IBKR
 
 #Create a trade exit during high-volatility times like earnings and FOMC rate decisions
 
 ###############################################################################
 
-#CHATGPT verfied#
+#verfied#
 
 from ib_insync import *
 import sys 
