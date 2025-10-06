@@ -22,17 +22,14 @@ def HMA(series, period):
 
 #get candles and indicator data specifically for hma_200strat8
 
-def get_hma_strat8_data(ib, contract, end_dt: datetime.datetime):
-
-    end_dt = end_dt.astimezone(NY)
-    end_dt_str = end_dt.strftime("%Y%m%d %H:%M:%S America/New_York")
+def get_hma_strat8_data(ib, contract):
 
     #gets candle bars
 
     try:
         bars = ib.reqHistoricalData(
             contract,
-            endDateTime=end_dt_str,
+            endDateTime='',
             durationStr='10 D',
             barSizeSetting='15 mins',
             whatToShow='TRADES',

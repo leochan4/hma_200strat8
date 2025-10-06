@@ -21,7 +21,7 @@ import time
 import datetime
 import os
 import traceback
-import smtplib
+import smtplib, ssl
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 import json
@@ -56,12 +56,12 @@ ticker = 'NVDA'
 #sets the email info from env. into these
 
 email_settings = {
-    'sender': os.getenv('EMAIL_SENDER'),
-    'recipient': os.getenv('EMAIL_RECIPIENT'),
-    'smtp_server': os.getenv('SMTP_SERVER'),
-    'smtp_port': int(os.getenv('SMTP_PORT')),
-    'username': os.getenv('EMAIL_SENDER'),
-    'password': os.getenv('EMAIL_PASSWORD')
+    'sender': os.getenv('GMAIL_USER').strip(),
+    'recipient': os.getenv('ALERT_EMAIL').strip(),
+    'smtp_server': os.getenv('SMTP_HOST', default="smtp.gmail.com"),
+    'smtp_port': int(os.getenv('SMTP_PORT', default="465")),
+    'username': os.getenv('GMAIL_USER').strip(),
+    'password': os.getenv('GMAIL_APP_PASSWORD').strip()
 }
 
 # === Returns the current time in whole 15mins === #
@@ -336,7 +336,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
 
                     #retrives the previous days candle bars, calculates indicator values
 
-                    latest, prev = get_hma_strat8_data(ib, contract, end_dt = bar_ts)
+                    latest, prev = get_hma_strat8_data(ib, contract)
 
                     print("Latest:", latest)
                     print("Previous:", prev)
