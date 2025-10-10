@@ -3,30 +3,33 @@ import pandas as pd
 import numpy as np
 import math
 
+def _get_netliquidation(ib, currency_preference=("USD", "CAD"), tries=5, sleep_sec=0.5):
+    for _ in range(tries):
+        summary = ib.accountSummary()
+        df = util.df(summary)
+        if not df.empty:
+            for cur in currency_preference:
+                nl = df[(df.tag == 'NetLiquidation') & (df.currency == cur)]
+                if not nl.empty:
+                    return float(nl['value'].astype(float).iloc[0])
 
-KELLY_f = 0.25
+        ib.sleep(sleep_sec)
 
-def calc_pos_size(ib, price, account: str = None):
+    if not df.empty:
+        nl_any = df[df.tag == 'NetLiquidation']
+        if not nl_any.empty:
+            return float(nl_any['value'].astype(float).iloc[0])
+    raise RuntimeError("NetLiquidation (equity) not available from accountSummary()")      
 
-    if price <= 0:
-        raise ValueError("Price must be > 0 to calculate position size.")
-    
 
-    summary_df = util.df(ib.accountSummary(account))
-    nl = summary_df[summary_df['tag'] == 'NetLiquidation']
-
-    if nl.empty:
-        raise RuntimeError("NetLiquidation not found in account summary")
+def calc_pos_size(ib, price, KELLY_f = 0.25, min_size=1):
 
     # get NetLiquidation (your total account equity)
-    equity = float(nl.loc[0]['value'])
-    currency = nl.loc[0]['currency']
+    equity = _get_netliquidation(ib)
 
-    print(f"Current equity: {equity} {currency}") 
+    print(f"Current equity: {equity}")
 
-    pos_size = equity * KELLY_f
+    pos_size = max(0.0, equity * KELLY_f)
 
-    stock_units = math.floor(pos_size/price)
-
-
-    return stock_units
+    size = max(min_size, int(pos_size / max(price, 1e-9)))
+    return size

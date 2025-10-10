@@ -9,6 +9,8 @@
 
 #Create a trade exit during high-volatility times like earnings and FOMC rate decisions
 
+
+#in the big loop, if an exception error is thrown, have it disconnect. Next loop, it will try reconnecting again, but have the reconnected be limited to 5 attempts. 
 ###############################################################################
 
 #verfied#
@@ -30,8 +32,10 @@ from zoneinfo import ZoneInfo
 
 # local market timezone, not local computer's
 NY = ZoneInfo("America/New_York")
+
 COMM_PER_SHARE = 0.01
 
+BASE_CLIENT_ID = 1001
 
 
 
@@ -222,6 +226,24 @@ def broker_reconcile(ib, contract, expected_pos, account_id=None):
     
     return expected_pos, True
 
+def connect_or_retry(ib: IB, host='127.0.0.1', port=7497, base_id=BASE_CLIENT_ID, tries=6):
+    cid = base_id
+    for n in range(tries):
+        try:
+            ib.connect(host, port, clientId=cid, timeout=10)
+            ib.sleep(0.5)  # allow account/tickers to populate
+            print(f"✅ Connected (clientId={cid})")
+            return cid
+        except Exception as e:
+            msg = str(e).lower()
+            ib.disconnect()
+            if 'client id is already in use' in msg or 'peer closed connection' in msg:
+                cid += 1                     # ← auto-bump
+            time.sleep(min(60, 2 + 3*n))     # backoff
+    raise RuntimeError("Unable to connect after retries.")
+
+
+
 # === Main Bot ===
 
 def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
@@ -234,9 +256,20 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
 
         try:
 
-            #connects to IB server
             ib = IB()
-            ib.connect('127.0.0.1', 7497, clientId=1)
+            try:
+                connect_or_retry(ib)
+            except Exception as e:
+                print(f"❌ Initial connect failed: {e}")
+                log_exception(f"Initial connect failed: {e}", tz='LOCAL')
+                time.sleep(60)
+
+                continue
+
+            '''#connects to IB server
+            print("Connecting to IBKR...")
+            ib = IB()
+            ib.connect('127.0.0.1', 7497, clientId=1)'''
 
             #creates contract, pick stock of choice
             contract = Stock(ticker, 'SMART', 'USD')
@@ -261,8 +294,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
             print("Bot started. Waiting for 15-min intervals...")
             
             #calculates and checks indicators every 15min
-            retry_count = 0
-            MAX_RECONNECT = 60
+        
 
             while True:
 
@@ -277,7 +309,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                     continue
 
 
-                # Check if disconnected from TWS, reconnect if needed
+                '''# Check if disconnected from TWS, reconnect if needed
                 if not ib.isConnected():
                     print("Reconnecting to IBKR...")
                     try:
@@ -297,7 +329,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                             sys.exit(1)  # exit the script
 
                         time.sleep(60)
-                        continue  # Try again in next loop
+                        continue  # Try again in next loop'''
 
 
                 now = datetime.datetime.now(NY)
@@ -665,7 +697,7 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
                         
                     
 
-                time.sleep(1)
+                ib.sleep(1)
 
         #any errors will channel here
 
@@ -674,12 +706,25 @@ def run_hma200strat8(email_settings, threshold=1.2, log_file='trade_log.csv'):
             #writes error message and sends email
             msg = f"hma_200strat8 crashed at {datetime.datetime.now()}:\n\n{traceback.format_exc()}"
             print(msg)
-            send_email("hma_200strat8 BOT CRASHED", msg, email_settings)
+
+            try:
+                send_email("hma_200strat8 BOT CRASHED", msg, email_settings)
             
+            except Exception as mail_err:
+                print(f"Email failed: {mail_err}")
+
             #logs error onto .csv
             log_exception(msg, tz='LOCAL')  # Log to file
 
-
+            try:
+                for o in ib.openOrders():
+                    ib.cancelOrder(o)
+                ib.sleep(0.5)
+            except Exception:
+                pass
+            finally:
+                try: ib.disconnect()
+                except Exception: pass
 
             time.sleep(60)  # wait before auto-restarting
 
